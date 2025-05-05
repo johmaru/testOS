@@ -1,0 +1,10 @@
+[package]
+name = "testOS"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[[bin]]
+name = "BOOTX64"
+path = "src/main.rs"
