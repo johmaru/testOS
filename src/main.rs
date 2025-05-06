@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::{cmp::min, mem::size_of, panic::PanicInfo, ptr::null_mut};
+use core::{cmp::min, mem::size_of, panic::PanicInfo, ptr::null_mut, arch::asm};
 type EfiHandle = u64;
 type EfiVoid = u8;
 type Result<T> = core::result::Result<T, &'static str>;
@@ -10,7 +10,7 @@ type Result<T> = core::result::Result<T, &'static str>;
 #[repr(C)]
 struct EfiBootServicesTable {
     _reserved: [u64; 40],
-    locate_protocol: unsafe extern "win64" fn(
+    locate_protocol: extern "win64" fn(
         protocol: *const EfiGuid,
         registration: *const EfiVoid,
         interface: *mut *mut EfiVoid,
@@ -183,9 +183,9 @@ unsafe fn unchecked_draw_point<T: Bitmap>(
 
 fn draw_point<T: Bitmap>(
     buf: &mut T,
+    color: u32,
     x: i64,
     y: i64,
-    color: u32,
 ) -> Result<()> {
     *(buf.pixel_at_mut(x, y).ok_or("Out of bounds")?) = color;
     Ok(())
@@ -213,7 +213,57 @@ fn fill_rect<T: Bitmap>(
     Ok(())
 }
 
-#[unsafe(no_mangle)]
+fn calc_slope_point(
+    da: i64,
+    db: i64,
+    ia: i64,
+) -> Option<i64> {
+    if da < db{ 
+        None
+    } else if da == 0 {
+        Some(0)
+    } else if (0..=da).contains(&ia) {
+        Some((2 * db * ia + da) / da / 2)
+    } else {
+        None
+    }
+}
+
+fn draw_line<T: Bitmap>(
+    buf: &mut T,
+    color: u32,
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+) -> Result<()> {
+    if !buf.is_in_x_range(x0)
+        || !buf.is_in_x_range(x1)
+        || !buf.is_in_y_range(y0)
+        || !buf.is_in_y_range(y1)
+    {
+        return Err("Out of bounds");
+    }
+    let dx = (x1 - x0).abs();
+    let sx = (x1 - x0).signum();
+    let dy = (y1 - y0).abs();
+    let sy = (y1 - y0).signum();
+    if dx >= dy {
+        for (rx, ry) in (0..dx)
+            .flat_map(|rx| calc_slope_point(dx, dy, rx).map(|ry| (rx, ry))){
+                draw_point(buf, color,x0 + rx * sx, y0 + ry * sy)?;
+            }
+    } else {
+        for (rx, ry) in (0..dy)
+            .flat_map(|ry| calc_slope_point(dy, dx, ry).map(|rx| (rx, ry))) {
+                draw_point(buf, color,x0 + rx * sx, y0 + ry * sy)?;
+            }
+    }
+    Ok(())    
+}
+
+// EFIのエントリポイント
+#[no_mangle]
 fn efi_main(
     _image_handle: EfiHandle,
     efi_system_table: &EfiSystemTable,
@@ -227,12 +277,30 @@ fn efi_main(
     fill_rect(&mut vram, 64, 64, 64, 64, 0x00ff00).expect("Failed to fill rect");
     fill_rect(&mut vram, 128, 128, 128, 128, 0x0000ff).expect("Failed to fill rect");
     for i in 0..256 {
-        let _ = draw_point(&mut vram, i, i, 0x010101 * i as u32);
+        let _ = draw_point(&mut vram, 0x010101 * i as u32,i, i);
+    }
+    let grid_size: i64 = 32;
+    let rect_size: i64 = grid_size * 8;
+    for i in (0..=rect_size).step_by(grid_size as usize) {
+        let _ = draw_line(&mut vram,0xff0000 ,0, i, rect_size, i);
+        let _ = draw_line(&mut vram, 0xff0000,i, 0, i, rect_size);
+    }
+    let cx = rect_size / 2;
+    let cy = rect_size / 2;
+    for i in (0..=rect_size).step_by(grid_size as usize) {
+        let _ = draw_line(&mut vram, 0xffff00,cx, cy, 0, i);
+        let _ = draw_line(&mut vram, 0x00ffff,cx, cy, i, 0);
+        let _ = draw_line(&mut vram, 0xff00ff,cx, cy, rect_size, i);
+        let _ = draw_line(&mut vram, 0xffffff,cx, cy,i, rect_size);
     }
 
     //println!("Hello, world!");
 
-    loop {}
+    loop {
+        unsafe {
+            asm!("hlt");
+        }
+    }
 }
 
 #[panic_handler]
