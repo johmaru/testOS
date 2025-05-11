@@ -1,7 +1,14 @@
 #![no_std]
 #![no_main]
 
-use core::{arch::asm, cmp::min, mem::size_of, panic::PanicInfo, ptr::null_mut};
+use core::{arch::asm, 
+        cmp::min,
+        fmt,
+        fmt::Write,
+        mem::size_of,
+        panic::PanicInfo,
+        ptr::null_mut,
+        writeln};
 type EfiHandle = u64;
 type EfiVoid = u8;
 type Result<T> = core::result::Result<T, &'static str>;
@@ -9,12 +16,116 @@ type Result<T> = core::result::Result<T, &'static str>;
 
 #[repr(C)]
 struct EfiBootServicesTable {
-    _reserved: [u64; 40],
+    _reserved0: [u64; 7],
+    get_memory_map: extern "win64" fn(
+        memory_map_size: *mut usize,
+        memory_map: *mut u8,
+        map_key: *mut usize,
+        descripter_size: *mut usize,
+        descriptor_version: *mut u32,
+    ) -> EfiStatus,
+    _reserved1: [u64; 32],
     locate_protocol: extern "win64" fn(
         protocol: *const EfiGuid,
         registration: *const EfiVoid,
         interface: *mut *mut EfiVoid,
     ) -> EfiStatus,
+}
+
+impl EfiBootServicesTable{
+    fn get_memory_map(
+        &self,
+        map: &mut MemoryMapHolder,
+    ) -> EfiStatus {
+        (self.get_memory_map)(
+            &mut map.size,
+            map.buffer.as_mut_ptr(),
+            &mut map.map_key,
+            &mut map.descriptor_size,
+            &mut map.descriptor_version,
+        )
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct MemoryDescriptor {
+    memory_type: EfiMemoryType,
+    physical_start: u64,
+    virtual_start: u64,
+    number_of_pages: u64,
+    attribute: u64,
+}
+
+#[repr(i64)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(non_camel_case_types)]
+pub enum EfiMemoryType {
+    RESERVED = 0,
+    LOADER_CODE,
+    LOADER_DATA,
+    BOOT_SERVICES_CODE,
+    BOOT_SERVICES_DATA,
+    RUNTIME_SERVICES_CODE,
+    RUNTIME_SERVICES_DATA,
+    CONVENTIONAL_MEMORY,
+    UNUSABLE_MEMORY,
+    ACPI_RECLAIM_MEMORY,
+    ACPI_NVS_MEMORY,
+    MEMORY_MAPPED_IO,
+    MEMORY_MAPPED_IO_PORT_SPACE,
+    PAL_CODE,
+    PERSISTENT_MEMORY,
+}
+
+const MEMORY_MAP_BUFFER_SIZE: usize = 0x8000;
+
+struct MemoryMapHolder {
+    buffer: [u8; MEMORY_MAP_BUFFER_SIZE],
+    size: usize,
+    map_key: usize,
+    descriptor_size: usize,
+    descriptor_version: u32,
+}
+
+struct MemoryMapIterator<'a> {
+    map: &'a MemoryMapHolder,
+    ofs: usize,
+}
+
+impl<'a> Iterator for MemoryMapIterator<'a>{
+    type Item = &'a MemoryDescriptor;
+    fn next(&mut self) -> Option<&'a MemoryDescriptor> {
+        if self.ofs >= self.map.size {
+            return None;
+        }
+        else {
+            let e: &MemoryDescriptor = unsafe {
+                &*(self.map.buffer.as_ptr().add(self.ofs) as *const MemoryDescriptor)
+            };
+            self.ofs += self.map.descriptor_size;
+            Some(e)
+        }
+    }
+}
+
+impl MemoryMapHolder {
+    pub const fn new() -> MemoryMapHolder {
+        MemoryMapHolder {
+            buffer: [0; MEMORY_MAP_BUFFER_SIZE],
+            size: MEMORY_MAP_BUFFER_SIZE,
+            map_key: 0,
+            descriptor_size: 0,
+            descriptor_version: 0,
+        }
+    }
+
+    pub fn iter(&self) -> MemoryMapIterator {
+        MemoryMapIterator {
+            map: self,
+            ofs: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -262,6 +373,26 @@ fn draw_line<T: Bitmap>(
     Ok(())    
 }
 
+fn draw_test_pattern<T: Bitmap>(buf: &mut T) {
+    let w = 128;
+    let left = buf.width() - w - 1;
+    let colors = [ 0x000000, 0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff ];
+    let h = 64;
+    for (i, c) in colors.iter().enumerate() {
+        let y = i as i64 * h;
+        fill_rect(buf, left, y, h, h, *c).expect("Failed to fill rect");
+        fill_rect(buf, left + h, y, h, h, !*c).expect("Failed to fill rect");
+    }
+    let points = [(0,0), (0,w), (w,0), (w,w)];
+    for (x0,y0) in points.iter() {
+        for (x1,y1) in points.iter() {
+            draw_line(buf, 0xffffff, left + *x0, *y0, left + *x1, *y1).expect("Failed to draw line");
+        }
+    }
+    draw_str_fg(buf, left, h * colors.len() as i64, 0x00ff00, "0123456789");
+    draw_str_fg(buf, left, h * colors.len() as i64 + 16, 0x00ff00, "ABCDEF");
+}
+
 fn lookup_font(
     c: char,
 ) -> Option<[[char; 8]; 16]>{
@@ -322,6 +453,35 @@ fn draw_str_fg<T: Bitmap>(
     }
 }
 
+struct VramTextWriter<'a> {
+    vram: &'a mut VramBufferInfo,
+    curor_x: i64,
+    curor_y: i64,
+}
+
+impl<'a> VramTextWriter<'a> {
+    fn new(vram: &'a mut VramBufferInfo) -> Self {
+        Self { vram,
+            curor_x: 0,
+            curor_y: 0 }
+    }
+}
+
+impl fmt::Write for VramTextWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            if c == '\n' {
+                self.curor_x = 0;
+                self.curor_y += 16;
+                continue;
+            } 
+            draw_font_fg(self.vram, self.curor_x, self.curor_y, 0xffffff, c);
+            self.curor_x += 8;
+        }
+        Ok(())
+    }
+}
+
 // EFIのエントリポイント
 #[no_mangle]
 fn efi_main(
@@ -333,32 +493,25 @@ fn efi_main(
     let vw = vram.width();
     let vh = vram.height();
     fill_rect(&mut vram, 0, 0, vw, vh, 0x000000).expect("Failed to fill rect");
-    fill_rect(&mut vram, 32, 32, 32, 32, 0xff0000).expect("Failed to fill rect");
-    fill_rect(&mut vram, 64, 64, 64, 64, 0x00ff00).expect("Failed to fill rect");
-    fill_rect(&mut vram, 128, 128, 128, 128, 0x0000ff).expect("Failed to fill rect");
-    for i in 0..256 {
-        let _ = draw_point(&mut vram, 0x010101 * i as u32,i, i);
-    }
-    let grid_size: i64 = 32;
-    let rect_size: i64 = grid_size * 8;
-    for i in (0..=rect_size).step_by(grid_size as usize) {
-        let _ = draw_line(&mut vram,0xff0000 ,0, i, rect_size, i);
-        let _ = draw_line(&mut vram, 0xff0000,i, 0, i, rect_size);
-    }
-    let cx = rect_size / 2;
-    let cy = rect_size / 2;
-    for i in (0..=rect_size).step_by(grid_size as usize) {
-        let _ = draw_line(&mut vram, 0xffff00,cx, cy, 0, i);
-        let _ = draw_line(&mut vram, 0x00ffff,cx, cy, i, 0);
-        let _ = draw_line(&mut vram, 0xff00ff,cx, cy, rect_size, i);
-        let _ = draw_line(&mut vram, 0xffffff,cx, cy,i, rect_size);
+    draw_test_pattern(&mut vram);
+    let mut w = VramTextWriter::new(&mut vram);
+    for i in 0..4 {
+        writeln!(w, "i = {i}").unwrap();
     }
 
-    for (i, c) in "ABCDEF".chars().enumerate() {
-        draw_font_fg(&mut vram, i as i64 * 16 + 256, i as i64 * 16, 0xffffff, c);
+    let mut memory_map = MemoryMapHolder::new();
+    let status = efi_system_table.boot_services.get_memory_map(&mut memory_map);
+    writeln!(w, "EFI_STATUS: {status:?}").unwrap();
+    let mut total_memory_page = 0;
+    for e in memory_map.iter() {
+        if e.memory_type != EfiMemoryType::CONVENTIONAL_MEMORY {
+            continue;
+        }
+        total_memory_page += e.number_of_pages;
+        writeln!(w, "{e:?}").unwrap();
     }
-
-    draw_str_fg(&mut vram, 0, 0, 0xffffff, "Hello, world!");
+    let total_memory_size = total_memory_page * 4096 / 1024 / 1024;
+    writeln!(w, "Total memory size: {total_memory_size}MiB").unwrap();
 
     //println!("Hello, world!");
 
