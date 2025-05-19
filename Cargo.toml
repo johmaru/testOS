@@ -9,3 +9,9 @@ edition = "2021"
 name = "BOOTX64"
 path = "src/main.rs"
 test = false
+
+[profile.test]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
